@@ -37,10 +37,11 @@ export function isTokenValid(token = getToken()) {
 }
 
 export class ApiError extends Error {
-  constructor(status, code) {
+  constructor(status, code, details) {
     super(`API error ${status}${code ? `: ${code}` : ''}`);
     this.status = status; // HTTP-статус відповіді
     this.code = code; // поле "error" з тіла відповіді, напр. "invalid_credentials"
+    this.details = details; // для validation_error: [{ field, message }]
   }
 }
 
@@ -72,7 +73,7 @@ export async function apiFetch(path, options = {}) {
       clearToken();
       window.location.assign('/login');
     }
-    throw new ApiError(res.status, data?.error);
+    throw new ApiError(res.status, data?.error, data?.details);
   }
 
   return data;
