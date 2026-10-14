@@ -30,6 +30,14 @@ export default function App() {
           </RequireAuth>
         }
       />
+      <Route
+        path="/products/:id/edit"
+        element={
+          <RequireAuth>
+            <ProductForm />
+          </RequireAuth>
+        }
+      />
       <Route path="*" element={<Navigate to="/products" replace />} />
     </Routes>
   );

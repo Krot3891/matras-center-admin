@@ -26,7 +26,9 @@ export default function ProductsList() {
 
       <ul>
         {products.map((p) => (
-          <li key={p.id}>{p.name} — {p.price} ₴</li>
+          <li key={p.id}>
+            {p.name} — {p.price} ₴ <Link to={`/products/${p.id}/edit`}>Редагувати</Link>
+          </li>
         ))}
       </ul>
     </div>
