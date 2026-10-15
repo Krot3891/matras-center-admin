@@ -54,7 +54,8 @@ export async function apiFetch(path, options = {}) {
   const res = await fetch(`${API_URL}${path}`, {
     ...fetchOptions,
     headers: {
-      'Content-Type': 'application/json',
+      // для FormData (завантаження файлів) Content-Type не ставимо: браузер сам додасть multipart із boundary
+      ...(fetchOptions.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...fetchOptions.headers,
     },

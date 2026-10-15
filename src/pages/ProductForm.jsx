@@ -1,12 +1,17 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { apiFetch, ApiError } from '../lib/api.js';
+import { MAX_PHOTOS, selectPhotos, uploadErrorText } from '../lib/photoRules.js';
 
 // Форма товару: додавання (/products/new, POST /products) і редагування (/products/:id/edit, PATCH /products/:id).
 // Поля відповідають контракту matras-center-api: name, description, price, categoryId, sku, stockQty.
 // slug сервер створює сам і не змінює. Окремого GET /products/:id в API немає, тому при редагуванні
 // товар береться зі списку GET /products (публічного, лише опубліковані) за id.
-// Фото поки не завантажуються (Cloudflare R2 ще не підключено) — поле позначено як недоступне.
+//
+// Фото (JPEG/PNG/WebP, до 5 МБ, до 10 на товар) вибираються у формі й завантажуються при збереженні:
+//  - створення: кожен файл → POST /uploads/images (поле file) → url; потім POST /products з images: [{ url }];
+//  - редагування: спершу PATCH полів, потім кожен новий файл → POST /products/:id/images (завантаження + прив'язка).
+// Видалення збережених фото API ще не підтримує, тому вони лише показуються.
 
 const FIELD_LABELS = {
   name: 'Назва',
@@ -58,6 +63,17 @@ export default function ProductForm() {
   const [categoriesState, setCategoriesState] = useState('loading'); // loading | ready | error
   const [errors, setErrors] = useState([]);
   const [saving, setSaving] = useState(false);
+  const [savingLabel, setSavingLabel] = useState('Зберігаємо…');
+  // Фото: збережені (лише при редагуванні) і вибрані, але ще не збережені ({ key, file, preview, url?, error? })
+  const [existingImages, setExistingImages] = useState([]);
+  const [photos, setPhotos] = useState([]);
+  const [photoNotes, setPhotoNotes] = useState([]);
+  const photosRef = useRef(photos);
+  photosRef.current = photos;
+  const photoKey = useRef(0);
+
+  // прев'ю — це blob-посилання; звільняємо їх при виході зі сторінки
+  useEffect(() => () => photosRef.current.forEach((p) => URL.revokeObjectURL(p.preview)), []);
 
   useEffect(() => {
     apiFetch('/categories')
@@ -80,6 +96,7 @@ export default function ProductForm() {
         const values = toFormValues(product);
         setInitial(values);
         setForm(values);
+        setExistingImages(product.images || []);
         setProductState('ready');
       })
       .catch(() => !cancelled && setProductState('error'));
@@ -92,9 +109,41 @@ export default function ProductForm() {
     setForm({ ...form, [e.target.name]: e.target.value });
   }
 
+  function handleFilesChange(e) {
+    const { accepted, errors: rejected } = selectPhotos(
+      Array.from(e.target.files || []),
+      existingImages.length + photos.length
+    );
+    e.target.value = ''; // щоб той самий файл можна було вибрати знову
+    setPhotoNotes(rejected);
+    setPhotos((prev) => [
+      ...prev,
+      ...accepted.map((file) => {
+        photoKey.current += 1;
+        return { key: photoKey.current, file, preview: URL.createObjectURL(file) };
+      }),
+    ]);
+  }
+
+  function removePhoto(key) {
+    const photo = photos.find((p) => p.key === key);
+    if (photo) URL.revokeObjectURL(photo.preview);
+    setPhotos((prev) => prev.filter((p) => p.key !== key));
+    setPhotoNotes([]);
+  }
+
+  const patchPhoto = (key, patch) => setPhotos((prev) => prev.map((p) => (p.key === key ? { ...p, ...patch } : p)));
+
+  const uploadFile = (path, file) => {
+    const body = new FormData();
+    body.append('file', file); // API очікує файл у полі "file"
+    return apiFetch(path, { method: 'POST', body });
+  };
+
   async function handleSubmit(e) {
     e.preventDefault();
     setErrors([]);
+    setPhotoNotes([]);
     const values = {
       name: form.name.trim(),
       description: form.description.trim(),
@@ -104,31 +153,104 @@ export default function ProductForm() {
       ...(form.stockQty !== '' ? { stockQty: Number(form.stockQty) } : {}),
     };
 
-    let request;
     if (isEdit) {
       // PATCH: надсилаємо лише змінені поля
-      const before = initial;
       const changed = {};
       for (const [key, value] of Object.entries(values)) {
-        const was = ['price', 'stockQty'].includes(key) ? Number(before[key]) : before[key].trim();
+        const was = ['price', 'stockQty'].includes(key) ? Number(initial[key]) : initial[key].trim();
         if (value !== was) changed[key] = value;
       }
-      if (Object.keys(changed).length === 0) {
+      if (Object.keys(changed).length === 0 && photos.length === 0) {
         setErrors(['Змін не внесено.']);
         return;
       }
-      request = { path: `/products/${encodeURIComponent(id)}`, method: 'PATCH', body: changed };
-    } else {
-      request = { path: '/products', method: 'POST', body: values };
+
+      setSaving(true);
+      setSavingLabel('Зберігаємо…');
+      try {
+        if (Object.keys(changed).length > 0) {
+          await apiFetch(`/products/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(changed) });
+          // поля збережено: надалі порівнюємо з новими значеннями (повторне збереження не надішле їх знову)
+          const saved = {
+            name: values.name,
+            description: values.description,
+            price: String(values.price),
+            categoryId: values.categoryId,
+            sku: values.sku,
+            stockQty: 'stockQty' in values ? String(values.stockQty) : initial.stockQty,
+          };
+          setInitial(saved);
+          setForm(saved);
+        }
+      } catch (err) {
+        // введені дані (і вибрані фото) лишаються у формі
+        setErrors(saveErrorMessages(err, true));
+        setSaving(false);
+        return;
+      }
+
+      // Нові фото: POST /products/:id/images (завантаження в R2 + запис ProductImage)
+      const failed = [];
+      const list = [...photos];
+      for (let i = 0; i < list.length; i += 1) {
+        const photo = list[i];
+        setSavingLabel(`Завантажуємо фото ${i + 1} з ${list.length}…`);
+        try {
+          const row = await uploadFile(`/products/${encodeURIComponent(id)}/images`, photo.file);
+          setExistingImages((prev) => [...prev, row]);
+          URL.revokeObjectURL(photo.preview);
+          setPhotos((prev) => prev.filter((p) => p.key !== photo.key));
+        } catch (err) {
+          const message = uploadErrorText(err instanceof ApiError ? err : {});
+          patchPhoto(photo.key, { error: message });
+          failed.push(`${photo.file.name}: ${message}`);
+          if (err instanceof ApiError && ['too_many_images', 'not_found', 'storage_not_configured'].includes(err.code)) break;
+        }
+      }
+      if (failed.length > 0) {
+        setErrors(['Дані товару збережено, але не всі фото завантажено:', ...failed]);
+        setSaving(false);
+        return;
+      }
+      navigate('/products');
+      return;
     }
 
+    // Створення: спершу фото → POST /uploads/images (отримуємо url), потім сам товар з images
     setSaving(true);
+    const failed = [];
+    const list = photos.map((p) => ({ ...p }));
+    for (let i = 0; i < list.length; i += 1) {
+      const photo = list[i];
+      if (photo.url) continue; // вже завантажено під час попередньої спроби — повторно не вантажимо
+      setSavingLabel(`Завантажуємо фото ${i + 1} з ${list.length}…`);
+      try {
+        const uploaded = await uploadFile('/uploads/images', photo.file);
+        photo.url = uploaded.url;
+        patchPhoto(photo.key, { url: uploaded.url, error: undefined });
+      } catch (err) {
+        const message = uploadErrorText(err instanceof ApiError ? err : {});
+        patchPhoto(photo.key, { error: message });
+        failed.push(`${photo.file.name}: ${message}`);
+        if (err instanceof ApiError && ['storage_not_configured'].includes(err.code)) break;
+      }
+    }
+    if (failed.length > 0) {
+      setErrors(['Товар ще не створено — не всі фото завантажено:', ...failed]);
+      setSaving(false);
+      return;
+    }
+
+    setSavingLabel('Зберігаємо…');
     try {
-      await apiFetch(request.path, { method: request.method, body: JSON.stringify(request.body) });
+      await apiFetch('/products', {
+        method: 'POST',
+        body: JSON.stringify({ ...values, ...(list.length ? { images: list.map((p) => ({ url: p.url })) } : {}) }),
+      });
       navigate('/products');
     } catch (err) {
-      // введені дані лишаються у формі
-      setErrors(saveErrorMessages(err, isEdit));
+      // введені дані та вибрані фото лишаються у формі (завантажені файли повторно не вантажаться)
+      setErrors(saveErrorMessages(err, false));
       setSaving(false);
     }
   }
@@ -245,18 +367,63 @@ export default function ProductForm() {
         </div>
 
         <div style={{ marginBottom: 12 }}>
-          <label>Фото товару (недоступно)</label>
+          <label>Фото товару</label>
           <input
             type="file"
+            name="photos"
             multiple
-            accept="image/*"
-            disabled
+            accept="image/jpeg,image/png,image/webp"
+            onChange={handleFilesChange}
+            disabled={saving || existingImages.length + photos.length >= MAX_PHOTOS}
             style={{ display: 'block', width: '100%' }}
           />
           <small>
-            Недоступно: завантаження фото в Cloudflare R2 ще не підключено.{' '}
-            {isEdit ? 'Фото товару не змінюються.' : 'Товар буде збережено без фото.'}
+            JPEG, PNG або WebP, до 5 МБ кожне, не більше {MAX_PHOTOS} фото на товар. Фото завантажаться після
+            натискання «{isEdit ? 'Зберегти зміни' : 'Зберегти товар'}».
+            {isEdit && ' Видалити збережені фото поки що не можна.'}
           </small>
+          {photoNotes.length > 0 && (
+            <div role="alert" style={{ color: 'crimson', margin: '4px 0' }}>
+              {photoNotes.map((msg) => (
+                <div key={msg}>
+                  <small>{msg}</small>
+                </div>
+              ))}
+            </div>
+          )}
+          {(existingImages.length > 0 || photos.length > 0) && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+              {existingImages.map((img) => (
+                <figure key={img.id} style={{ margin: 0, width: 96 }}>
+                  <img
+                    src={img.url}
+                    alt={img.alt || 'Фото товару'}
+                    style={{ width: 96, height: 96, objectFit: 'cover', display: 'block' }}
+                  />
+                  <figcaption>
+                    <small>збережено</small>
+                  </figcaption>
+                </figure>
+              ))}
+              {photos.map((p) => (
+                <figure key={p.key} data-pending-photo style={{ margin: 0, width: 96 }}>
+                  <img
+                    src={p.preview}
+                    alt={`Попередній перегляд: ${p.file.name}`}
+                    style={{ width: 96, height: 96, objectFit: 'cover', display: 'block' }}
+                  />
+                  <figcaption>
+                    <small style={{ color: p.error ? 'crimson' : undefined }}>
+                      {p.error ? 'помилка' : p.url ? 'завантажено' : 'буде завантажено'}
+                    </small>{' '}
+                    <button type="button" onClick={() => removePhoto(p.key)} disabled={saving} aria-label={`Прибрати ${p.file.name}`}>
+                      ✕
+                    </button>
+                  </figcaption>
+                </figure>
+              ))}
+            </div>
+          )}
         </div>
 
         {errors.length > 0 && (
@@ -270,7 +437,7 @@ export default function ProductForm() {
         )}
 
         <button type="submit" disabled={saving}>
-          {saving ? 'Зберігаємо…' : isEdit ? 'Зберегти зміни' : 'Зберегти товар'}
+          {saving ? savingLabel : isEdit ? 'Зберегти зміни' : 'Зберегти товар'}
         </button>
       </form>
     </div>
